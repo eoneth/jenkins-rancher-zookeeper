@@ -1,0 +1,274 @@
+#!/bin/bash
+
+#定义nfsPath路径
+
+nfsPath="/opt/${zkName}"
+
+
+for ((i=0; i<${replicas}; i++))
+do
+# 检查NFS目录
+echo ">>${i}"
+
+if [ ! -d "${nfsPath}-${i}" ]; then
+  echo ">>> 目录${nfsPath}-${i}不存在，正在创建!"
+  if mkdir ${nfsPath}-$i; then
+    if touch ${nfsPath}-$i/aa; then
+       chmod -R 777 ${nfsPath}-${i}
+       echo ">>> 目录已经创建."
+       rm  "${nfsPath}-$i/aa" -f
+    else 
+       echo ">>> 创建目录${nfsPath}-${i}失败,或目录不可写。"
+       exit 1
+    fi
+    else 
+    echo ">>> 创建目录${nfsPath}-${i}成功"
+  fi
+fi
+
+if grep -q "${nfsPath}-${i}" /etc/exports; then
+    echo ">>> 存在相应记录."
+  else
+    echo ">>> 增加NFS记录."
+    echo "${nfsPath}-${i} *(rw,no_root_squash,no_all_squash,sync)" >> /etc/exports
+    exportfs -rv  
+
+fi
+
+done
+
+#创建PV
+
+for ((i=0; i<${replicas}; i++))
+do
+if [ ! $(rancher kubectl get pv | awk -F " " '{print $1}' | grep "${zkName}-$i") ];then
+ echo ">>>该PV不存在,增加PV."
+ 
+cat <<EOF | rancher kubectl create -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${zkName}-$i
+  namespace: ${ns}
+spec:
+  capacity:
+    storage: 10Gi
+  claimRef:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    name: data-${zkName}-$i
+    namespace: ${ns}
+  accessModes:
+    - ReadWriteMany
+  nfs:
+    server: 192.168.7.206
+    path: "${nfsPath}-$i"
+EOF
+else 
+ echo ">>>该PV,${zkName}-$i已存在"
+
+fi
+done
+
+
+
+cat <<EOF |rancher kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zk-cm
+  namespace: ${ns}
+data:
+  client.cnxns: "60"
+  init: "10"
+  jvm.heap: 2G
+  purge.interval: "0"
+  snap.retain: "3"
+  sync: "5"
+  tick: "2000"
+EOF
+
+projectFlag=`rancher kubectl get statefulsets -n ${ns}| grep ${zkName} | wc -l`
+echo ">>>${redeployFlag}"
+
+# 如果存在deployment
+if [ $projectFlag -eq 1 ]; then
+  echo ">>>${zkName}已存在，删除${zkName}"
+  echo ">>>删除中......"
+  rancher kubectl delete statefulsets ${zkName} -n ${ns}
+  echo ">>>删除完成......"
+else
+echo ">>>${redeployFlag}"
+fi
+
+cat <<EOF | rancher kubectl apply  -f -
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  labels:
+    app: ${zkName}
+  name: ${zkName}
+  namespace: ${ns}
+spec:
+  replicas: ${replicas}     
+  selector:
+    matchLabels:
+      app: ${zkName}
+  serviceName: ${zkName}
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: ${zkName}
+    spec:
+      nodeSelector:
+        name: ${nodeSelector}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: ${zkName}
+                operator: In
+                values:
+                - ${zkName}
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - command:
+        - sh
+        - -c
+        - zkGenConfig.sh && zkServer.sh start-foreground
+        env:
+        - name: ZK_REPLICAS
+          value: "${replicas}"
+        - name: ZK_HEAP_SIZE
+          valueFrom:
+            configMapKeyRef:
+              key: jvm.heap
+              name: zk-cm
+        - name: ZK_TICK_TIME
+          valueFrom:
+            configMapKeyRef:
+              key: tick
+              name: zk-cm
+        - name: ZK_INIT_LIMIT
+          valueFrom:
+            configMapKeyRef:
+              key: init
+              name: zk-cm
+        - name: ZK_SYNC_LIMIT
+          valueFrom:
+            configMapKeyRef:
+              key: tick
+              name: zk-cm
+        - name: ZK_MAX_CLIENT_CNXNS
+          valueFrom:
+            configMapKeyRef:
+              key: client.cnxns
+              name: zk-cm
+        - name: ZK_SNAP_RETAIN_COUNT
+          valueFrom:
+            configMapKeyRef:
+              key: snap.retain
+              name: zk-cm
+        - name: ZK_PURGE_INTERVAL
+          valueFrom:
+            configMapKeyRef:
+              key: purge.interval
+              name: zk-cm
+        - name: ZK_CLIENT_PORT
+          value: "2181"
+        - name: ZK_SERVER_PORT
+          value: "2888"
+        - name: ZK_ELECTION_PORT
+          value: "3888"
+        image: 192.168.19.111/zhph/k8szk:v3
+        imagePullPolicy: Always
+        livenessProbe:
+          exec:
+            command:
+            - zkOk.sh
+          failureThreshold: 3
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: k8szk
+        ports:
+        - containerPort: 2181
+          name: client
+          protocol: TCP
+        - containerPort: 2888
+          name: server
+          protocol: TCP
+        - containerPort: 3888
+          name: leader-election
+          protocol: TCP
+        readinessProbe:
+          exec:
+            command:
+            - zkOk.sh
+          failureThreshold: 3
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        resources:
+          requests:
+            cpu: "2"
+            memory: 4Gi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/lib/zookeeper
+          name: data
+        - name: tz-config
+          mountPath: /etc/localtime
+      volumes:
+      - name: tz-config
+        hostPath:
+          path: /usr/share/zoneinfo/Asia/Shanghai
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+      terminationGracePeriodSeconds: 30
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      namespace: ${ns}
+    spec:
+      accessModes: [ "ReadWriteMany" ]
+      resources:
+        requests:
+          storage: 10G
+EOF
+
+cat <<EOF | rancher kubectl apply  -f -
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: ${zkName}
+  name: ${zkName}
+  namespace: ${ns}
+spec:
+  clusterIP: None
+  ports:
+  - name: server
+    port: 2888
+    protocol: TCP
+    targetPort: 2888
+  - name: leader-election
+    port: 3888
+    protocol: TCP
+    targetPort: 3888
+  selector:
+    app: ${zkName}
+  sessionAffinity: None
+  type: ClusterIP
+EOF
+
+
